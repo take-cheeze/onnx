@@ -168,3 +168,47 @@ unconditionally. The trade-off is unchanged either way: arena memory is only
 reclaimed when the arena dies, so this fits transient
 parse-then-serialize/discard bindings, not long-lived `ModelProto`s whose
 sub-messages are released individually over time.
+
+## Internal transient protos — Tier 2 & 3 (`arena_internal_benchmark`)
+
+Beyond the ingest boundary, the code builds protos *while operating on a model*
+and discards them. `arena_internal_benchmark.cc` models three such sites, each
+mapped to a real one. Unlike the binary-deserialize path, these are **allocation-
+heavy on both build and destroy**, so the arena is an unambiguous win at every
+size tested (Linux x86-64, GCC `-O3`, protobuf 3.21.12; 20k-node model, medians
+of repeat runs):
+
+| Pattern | real site | build | destroy | **total** |
+|---|---|---:|---:|---:|
+| **Tier 2** — whole-model deep clone (`CopyFrom`) | `ModelProto copy = model;` in `check_model` full_check (`onnx/checker.cc:1231`); version-converter round-trip (`onnx/common/ir_pb_converter.cc`) | ~38% | ~92% | **~64%** |
+| **Tier 3a** — pass-lifetime `TypeProto` pool | `InferredTypes` `vector<unique_ptr<TypeProto>>` (`onnx/shape_inference/implementation.cc:300`) | ~50% | ~98% | **~69%** |
+| **Tier 3b** — per-node `NodeProto` copy churn | throwaway `NodeProto copy_n(n)` per node (`implementation.cc:604`) | — | — | **~28–36%** |
+
+Notes:
+
+- **Tier 2** is the strongest self-contained opportunity: a deep clone allocates
+  the entire sub-message tree and then frees it, so both phases benefit. It needs
+  no API change — only the local `ModelProto copy` becomes arena-allocated. The
+  `full_check` copy is especially attractive because it exists *purely* to be
+  inferred-on and thrown away.
+- **Tier 3a** is the biggest relative win (~69%) because it is pure small-message
+  allocation with exactly arena lifetime (the `InferredTypes` vector already lives
+  for the whole pass, so the arena changes nothing about lifetime — only the
+  allocator). Capturing it means threading an arena into the inference pass.
+- **Tier 3b** wins on speed (~28–36%) but **raises peak memory**: the real code
+  frees each `copy_n` immediately (peak = one node), whereas an arena defers every
+  free to end-of-pass (peak = all nodes). This is the speed *ceiling*; whether it
+  is worth the memory depends on the workload. The `total_only` column reflects
+  that build and destroy are not separable here (heap frees interleave into the
+  loop).
+
+### Priority, combining both benchmarks
+
+1. **Text `parse_model` binding** (ingest) and **Tier 2 whole-model clones** —
+   robust ~40–65% wins, contained local changes, no API/behavior change.
+2. **Tier 3a inference type pool** — largest relative win, but needs an arena
+   threaded through the shape-inference pass; do it if inference shows up in
+   profiles.
+3. **Binary ingest bindings** and **Tier 3b node churn** — conditional: the former
+   only helps large models, the latter trades memory for speed. Gate on size /
+   measure first.

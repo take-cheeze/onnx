@@ -681,6 +681,8 @@ endif()
 if(ONNX_BUILD_BENCHMARKS)
   add_executable(onnx_arena_parse_benchmark ${ONNX_ROOT}/onnx/bench/arena_parse_benchmark.cc)
   target_link_libraries(onnx_arena_parse_benchmark PRIVATE onnx)
+  add_executable(onnx_arena_internal_benchmark ${ONNX_ROOT}/onnx/bench/arena_internal_benchmark.cc)
+  target_link_libraries(onnx_arena_internal_benchmark PRIVATE onnx)
 endif()
 
 include(cmake/summary.cmake)
