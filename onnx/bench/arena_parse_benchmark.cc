@@ -2,22 +2,26 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Micro-benchmark: parsing an ONNX text model into an arena-allocated
-// ModelProto versus a heap-allocated (default) ModelProto.
+// Micro-benchmark: building a ModelProto on a google::protobuf::Arena versus on
+// the heap (the default), for the two ways ONNX ingests a model in C++:
 //
-// The ONNX text parser (OnnxParser::Parse) builds the whole ModelProto tree by
-// calling mutable_*/add_* on the caller-supplied root message. protobuf
-// propagates the root message's arena to every sub-message created that way, so
-// creating the root on a google::protobuf::Arena makes the entire node /
-// attribute / tensor / value-info tree arena-allocated. This benchmark measures
-// what that buys us for two phases that dominate the lifetime of a freshly
-// parsed model:
+//   * text parsing      -- OnnxParser::Parse (onnx/defs/parser.h)
+//   * binary deserialize -- ParseProtoFromBytes (onnx/proto_utils.h), the path
+//                           every onnx/cpp2py_export.cc binding takes when it
+//                           receives serialized bytes from Python.
 //
-//   * parse       -- constructing the tree (thousands of small allocations)
-//   * destruction -- tearing it down (per-object dtors + free vs. one bulk free)
+// Both entry points fill a caller-supplied root message via mutable_*/add_*
+// (or ParseFromCodedStream), and protobuf propagates the root's arena to every
+// sub-message. So creating the root with Arena::CreateMessage<ModelProto> makes
+// the whole node/attribute/tensor/value-info tree arena-allocated, with no
+// change to the parser or the deserializer. For each ingest path the benchmark
+// times the two phases that dominate a transient model's lifetime:
 //
-// It deliberately depends only on the public parser API and std::chrono so it
-// pulls in no new third-party dependency.
+//   * build   -- constructing/deserializing the tree (many small allocations)
+//   * destroy -- tearing it down (per-object dtors + free vs. one bulk free)
+//
+// It depends only on public headers and std::chrono, so it pulls in no new
+// third-party dependency.
 
 #include <chrono>
 #include <cstdint>
@@ -25,20 +29,26 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
-#include <vector>
 
 #include "google/protobuf/arena.h"
 #include "onnx/defs/parser.h"
 #include "onnx/onnx_pb.h"
+#include "onnx/proto_utils.h"
 
 namespace {
 
 using ONNX_NAMESPACE::ModelProto;
 using ONNX_NAMESPACE::OnnxParser;
+using ONNX_NAMESPACE::ParseProtoFromBytes;
 using Clock = std::chrono::steady_clock;
 
 double MillisSince(Clock::time_point start) {
   return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+[[noreturn]] void Fail(const char* what) {
+  std::fprintf(stderr, "%s\n", what);
+  std::exit(1);
 }
 
 // Build an ONNX text model with `num_nodes` nodes. Each node carries a handful
@@ -88,41 +98,37 @@ std::string GenerateModelText(int num_nodes, int num_initializers, int initializ
 }
 
 struct PhaseTimes {
-  double parse_ms = 0;
+  double build_ms = 0;
   double destroy_ms = 0;
 };
 
-// Parse into a plain heap ModelProto and time construction + destruction.
-PhaseTimes RunHeap(const std::string& text) {
+// ---- Text parsing (OnnxParser::Parse) -------------------------------------
+
+PhaseTimes RunTextHeap(const std::string& text) {
   PhaseTimes t;
   auto* model = new ModelProto();
   auto start = Clock::now();
   OnnxParser parser(text);
   auto status = parser.Parse(*model);
-  t.parse_ms = MillisSince(start);
-  if (!status.IsOK()) {
-    std::fprintf(stderr, "parse failed: %s\n", status.ErrorMessage().c_str());
-    std::exit(1);
-  }
+  t.build_ms = MillisSince(start);
+  if (!status.IsOK())
+    Fail(status.ErrorMessage().c_str());
   start = Clock::now();
   delete model;
   t.destroy_ms = MillisSince(start);
   return t;
 }
 
-// Parse into an arena-allocated ModelProto and time construction + destruction.
-PhaseTimes RunArena(const std::string& text) {
+PhaseTimes RunTextArena(const std::string& text) {
   PhaseTimes t;
   auto arena = std::make_unique<google::protobuf::Arena>();
   auto* model = google::protobuf::Arena::CreateMessage<ModelProto>(arena.get());
   auto start = Clock::now();
   OnnxParser parser(text);
   auto status = parser.Parse(*model);
-  t.parse_ms = MillisSince(start);
-  if (!status.IsOK()) {
-    std::fprintf(stderr, "parse failed: %s\n", status.ErrorMessage().c_str());
-    std::exit(1);
-  }
+  t.build_ms = MillisSince(start);
+  if (!status.IsOK())
+    Fail(status.ErrorMessage().c_str());
   // Freeing the arena reclaims the whole ModelProto tree in one shot.
   start = Clock::now();
   arena.reset();
@@ -130,22 +136,69 @@ PhaseTimes RunArena(const std::string& text) {
   return t;
 }
 
+// ---- Binary deserialize (ParseProtoFromBytes) -----------------------------
+// This is the path every cpp2py_export.cc binding takes on serialized bytes.
+// ParseProtoFromBytes already works on an arena-allocated root unchanged; only
+// the allocation of the root differs between the two functions below.
+
+PhaseTimes RunBinaryHeap(const std::string& bytes) {
+  PhaseTimes t;
+  auto* model = new ModelProto();
+  auto start = Clock::now();
+  if (!ParseProtoFromBytes(model, bytes.data(), bytes.size()))
+    Fail("binary deserialize failed");
+  t.build_ms = MillisSince(start);
+  start = Clock::now();
+  delete model;
+  t.destroy_ms = MillisSince(start);
+  return t;
+}
+
+PhaseTimes RunBinaryArena(const std::string& bytes) {
+  PhaseTimes t;
+  auto arena = std::make_unique<google::protobuf::Arena>();
+  auto* model = google::protobuf::Arena::CreateMessage<ModelProto>(arena.get());
+  auto start = Clock::now();
+  if (!ParseProtoFromBytes(model, bytes.data(), bytes.size()))
+    Fail("binary deserialize failed");
+  t.build_ms = MillisSince(start);
+  start = Clock::now();
+  arena.reset();
+  t.destroy_ms = MillisSince(start);
+  return t;
+}
+
 struct Stats {
-  double parse_ms = 0;
+  double build_ms = 0;
   double destroy_ms = 0;
 };
 
-template <typename Fn>
-Stats Average(Fn&& fn, const std::string& text, int iters) {
+template <typename Fn, typename Input>
+Stats Average(Fn&& fn, const Input& input, int iters) {
   Stats total;
   for (int i = 0; i < iters; ++i) {
-    PhaseTimes t = fn(text);
-    total.parse_ms += t.parse_ms;
+    PhaseTimes t = fn(input);
+    total.build_ms += t.build_ms;
     total.destroy_ms += t.destroy_ms;
   }
-  total.parse_ms /= iters;
+  total.build_ms /= iters;
   total.destroy_ms /= iters;
   return total;
+}
+
+void PrintTable(const char* title, const Stats& heap, const Stats& arena) {
+  auto pct = [](double base, double other) { return (base - other) / base * 100.0; };
+  std::printf("%s\n", title);
+  std::printf("%-10s %12s %12s %12s\n", "", "build (ms)", "destroy (ms)", "total (ms)");
+  std::printf("%-10s %12.3f %12.3f %12.3f\n", "heap", heap.build_ms, heap.destroy_ms, heap.build_ms + heap.destroy_ms);
+  std::printf(
+      "%-10s %12.3f %12.3f %12.3f\n", "arena", arena.build_ms, arena.destroy_ms, arena.build_ms + arena.destroy_ms);
+  std::printf(
+      "%-10s %11.1f%% %11.1f%% %11.1f%%\n\n",
+      "faster",
+      pct(heap.build_ms, arena.build_ms),
+      pct(heap.destroy_ms, arena.destroy_ms),
+      pct(heap.build_ms + heap.destroy_ms, arena.build_ms + arena.destroy_ms));
 }
 
 } // namespace
@@ -157,34 +210,42 @@ int main(int argc, char** argv) {
   int iters = argc > 4 ? std::atoi(argv[4]) : 20;
 
   std::string text = GenerateModelText(num_nodes, num_initializers, initializer_len);
+
+  // Produce the binary form once, from the same model, so the two ingest paths
+  // build an identical ModelProto tree.
+  std::string bytes;
+  {
+    ModelProto reference;
+    if (!OnnxParser::Parse(reference, text).IsOK())
+      Fail("failed to parse reference model");
+    if (!reference.SerializeToString(&bytes))
+      Fail("failed to serialize reference model");
+  }
+
   std::printf(
-      "Model: %d nodes, %d initializers (len %d), text size %.2f MiB\n",
+      "Model: %d nodes, %d initializers (len %d)\n"
+      "  text size   %.2f MiB\n"
+      "  binary size %.2f MiB\n"
+      "Iterations: %d (plus 3 warmup)\n\n",
       num_nodes,
       num_initializers,
       initializer_len,
-      text.size() / 1048576.0);
-  std::printf("Iterations: %d (plus 3 warmup)\n\n", iters);
+      text.size() / 1048576.0,
+      bytes.size() / 1048576.0,
+      iters);
 
   // Warmup (parser static tables, page faults, cache).
   for (int i = 0; i < 3; ++i) {
-    RunHeap(text);
-    RunArena(text);
+    RunTextHeap(text);
+    RunTextArena(text);
+    RunBinaryHeap(bytes);
+    RunBinaryArena(bytes);
   }
 
-  Stats heap = Average(RunHeap, text, iters);
-  Stats arena = Average(RunArena, text, iters);
-
-  auto pct = [](double base, double other) { return (base - other) / base * 100.0; };
-
-  std::printf("%-10s %12s %12s %12s\n", "", "parse (ms)", "destroy (ms)", "total (ms)");
-  std::printf("%-10s %12.3f %12.3f %12.3f\n", "heap", heap.parse_ms, heap.destroy_ms, heap.parse_ms + heap.destroy_ms);
-  std::printf(
-      "%-10s %12.3f %12.3f %12.3f\n", "arena", arena.parse_ms, arena.destroy_ms, arena.parse_ms + arena.destroy_ms);
-  std::printf(
-      "%-10s %11.1f%% %11.1f%% %11.1f%%\n",
-      "faster",
-      pct(heap.parse_ms, arena.parse_ms),
-      pct(heap.destroy_ms, arena.destroy_ms),
-      pct(heap.parse_ms + heap.destroy_ms, arena.parse_ms + arena.destroy_ms));
+  PrintTable("[text parse]  OnnxParser::Parse", Average(RunTextHeap, text, iters), Average(RunTextArena, text, iters));
+  PrintTable(
+      "[binary]      ParseProtoFromBytes (cpp2py boundary path)",
+      Average(RunBinaryHeap, bytes, iters),
+      Average(RunBinaryArena, bytes, iters));
   return 0;
 }
