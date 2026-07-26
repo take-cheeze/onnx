@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <google/protobuf/arena.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/operators.h>
 #include <nanobind/stl/function.h>
@@ -112,11 +113,16 @@ static nb::object CastOrNone(const T* ptr) {
 
 template <typename ProtoType>
 static std::tuple<bool, nb::bytes, nb::bytes> Parse(const char* cstr) {
-  ProtoType proto{};
+  // The parsed proto is transient: it is serialized to bytes and immediately
+  // discarded. Build it (and, transitively, its whole sub-message tree) on an
+  // arena so teardown is a single bulk free instead of a per-sub-message
+  // destructor walk. The returned bytes are byte-for-byte unchanged.
+  google::protobuf::Arena arena;
+  ProtoType* proto = google::protobuf::Arena::CreateMessage<ProtoType>(&arena);
   OnnxParser parser(cstr);
-  auto status = parser.Parse(proto);
+  auto status = parser.Parse(*proto);
   const std::string& error_msg = status.ErrorMessage();
-  return std::make_tuple(status.IsOK(), nb::bytes(error_msg.c_str(), error_msg.size()), ProtoToBytes(proto));
+  return std::make_tuple(status.IsOK(), nb::bytes(error_msg.c_str(), error_msg.size()), ProtoToBytes(*proto));
 }
 
 template <typename ProtoType>
