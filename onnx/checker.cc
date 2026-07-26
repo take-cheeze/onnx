@@ -4,6 +4,8 @@
 
 #include "onnx/checker.h"
 
+#include <google/protobuf/arena.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <filesystem> // NOLINT(build/c++17)
@@ -1227,9 +1229,15 @@ void check_model(
   if (full_check) {
     ShapeInferenceOptions options{true, 1, false};
     // Do not update the model in place by the check from shape inference
-    // because checker should not modify the original model
-    ModelProto copy = model;
-    ONNX_NAMESPACE::shape_inference::InferShapes(copy, ctx.get_schema_registry(), options);
+    // because checker should not modify the original model.
+    // This copy is transient: it exists only to run shape inference on and is
+    // then discarded, so allocate it (and, transitively, its whole sub-message
+    // tree) on an arena. Tearing the copy down then becomes a single bulk free
+    // instead of a per-sub-message destructor walk.
+    google::protobuf::Arena arena;
+    ModelProto* copy = google::protobuf::Arena::CreateMessage<ModelProto>(&arena);
+    copy->CopyFrom(model);
+    ONNX_NAMESPACE::shape_inference::InferShapes(*copy, ctx.get_schema_registry(), options);
   }
 }
 

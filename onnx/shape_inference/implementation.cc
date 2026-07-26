@@ -4,6 +4,8 @@
 
 #include "onnx/shape_inference/implementation.h"
 
+#include <google/protobuf/arena.h>
+
 #include <algorithm>
 #include <fstream>
 #include <list>
@@ -297,15 +299,21 @@ class InferredTypes {
       *p->mutable_type() = type;
       return p->mutable_type();
     } else {
-      types.emplace_back(std::make_unique<TypeProto>(type));
-      return types.back().get();
+      // FunctionProto inference has no graph to store inferred types in, so we
+      // keep them alive on a temporary arena for the duration of the pass.
+      // Arena allocation turns teardown into a single bulk free instead of one
+      // heap deallocation per TypeProto. The returned pointer stays valid for
+      // the lifetime of this InferredTypes object, exactly as before.
+      auto* p = google::protobuf::Arena::CreateMessage<TypeProto>(&arena_);
+      p->CopyFrom(type);
+      return p;
     }
   }
 
   ~InferredTypes() = default;
 
  private:
-  std::vector<std::unique_ptr<TypeProto>> types;
+  google::protobuf::Arena arena_;
   GraphProto* graph_ptr;
   ONNX_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(InferredTypes);
 };
